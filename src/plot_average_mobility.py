@@ -28,13 +28,13 @@ ax.fill_between(
     stats['visit_year'],
     stats['mean'] - stats['std'],
     stats['mean'] + stats['std'],
-    alpha=0.2, color='steelblue', label='±1 std dev'
+    alpha=0.2, color='steelblue', label='±1 sigma'
 )
 
 # Mean line
 ax.plot(stats['visit_year'], stats['mean'],
         marker='o', linewidth=2.5, markersize=8,
-        color='steelblue', label='Mean score')
+        color='steelblue', label='Meðalgilidi')
 
 # Annotate each point with mean value and patient count
 for _, row in stats.iterrows():
@@ -45,9 +45,9 @@ for _, row in stats.iterrows():
         ha='center', fontsize=8
     )
 
-ax.set_title('Average MDS-UPDRS III Motor Score Over Time\nAll Patients (ON-medication)', fontsize=13)
-ax.set_xlabel('Years from Baseline')
-ax.set_ylabel('UPDRS-III Score (higher = worse)')
+ax.set_title('Meðals MDS-UPDRS III Skokr\nAllir sjúklingar (ON-medication)', fontsize=13)
+ax.set_xlabel('Ár frá baseline')
+ax.set_ylabel('UPDRS-III')
 ax.set_xticks(stats['visit_year'])
 ax.legend()
 ax.grid(True, alpha=0.3)
