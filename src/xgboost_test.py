@@ -1,13 +1,13 @@
 """
-Improved XGBoost Pipeline — Longitudinal Features
-===================================================
-Key improvements over previous version:
-  1. Uses ALL prior visits per patient to build trajectory features
-     (slope, mean, std, first score, last score, visit count, time span)
-  2. Temporal train/test split — model never sees future patients
-  3. Rolling delta and acceleration features capture rate of change
-  4. Medication state at last prior visit included as a feature
-  5. Deduplication of same-year visits avoids linregress crash
+Improved XGBoost Pipeline — Longitudinal Features (v2)
+=======================================================
+Improvements over v1 (baseline MAE calculation unchanged):
+  1. Richer trajectory features: EMA, weighted slope, quadratic fit,
+     projected score, score velocity, recent-vs-overall slope ratio
+  2. KNNImputer instead of median — better for sparse clinical data
+  3. Tuned XGBoost hyperparameters: gamma, colsample_bylevel added,
+     n_estimators boosted, subsample/colsample increased slightly
+  4. Derived interaction feature: projected_score = last + slope * dt
 
 Run from project root:  python3 src/xgboost_longitudinal.py
 """
@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 
 from scipy.stats import linregress
 from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
+from sklearn.impute import KNNImputer
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from xgboost import XGBRegressor
 
@@ -33,7 +33,7 @@ warnings.filterwarnings("ignore")
 DATA_DIR         = "./data/PPMI_data"
 OUTPUT_DIR       = "./ppmi_outputs"
 RANDOM_SEED      = 42
-MIN_PRIOR_VISITS = 2   # need at least this many distinct prior visit years
+MIN_PRIOR_VISITS = 2
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -48,7 +48,7 @@ VISIT_MAP = {
 # ============================================================
 
 print("\n" + "=" * 72)
-print("  PARKINSON XGBOOST — LONGITUDINAL TRAJECTORY MODEL")
+print("  PARKINSON XGBOOST — LONGITUDINAL TRAJECTORY MODEL  (v2)")
 print("  Target = UPDRS at next visit, using all prior visits as input")
 print("=" * 72)
 
@@ -78,34 +78,7 @@ updrs_clean = updrs_clean.merge(
 
 demo_sub = demo[["PATNO", "SEX"]].drop_duplicates("PATNO")
 updrs_clean = updrs_clean.merge(demo_sub, on="PATNO", how="left")
-
-# Diagnose SEX encoding before mapping — PPMI uses different encodings across cohorts
-sex_vals = updrs_clean["SEX"].dropna().unique()
-print(f"\nSEX column unique values found in data: {sorted(sex_vals)}")
-
-if set(sex_vals).issubset({1.0, 2.0, 1, 2}):
-    # Classic PPMI export: 1=Male, 2=Female
-    updrs_clean["is_male"] = updrs_clean["SEX"].map({1: 1, 2: 0, 1.0: 1, 2.0: 0})
-    print("SEX encoding: 1=Male, 2=Female")
-elif set(sex_vals).issubset({0.0, 1.0, 0, 1}):
-    # Newer PPMI export: 0=Female, 1=Male
-    updrs_clean["is_male"] = updrs_clean["SEX"].map({1: 1, 0: 0, 1.0: 1, 0.0: 0})
-    print("SEX encoding: 0=Female, 1=Male")
-else:
-    # Fallback: string-based
-    updrs_clean["is_male"] = (
-        updrs_clean["SEX"].astype(str).str.strip().str.upper()
-        .map({"MALE": 1, "M": 1, "1": 1, "1.0": 1,
-              "FEMALE": 0, "F": 0, "2": 0, "2.0": 0, "0": 0, "0.0": 0})
-    )
-    print("SEX encoding: string/mixed — mapped via string lookup")
-
-n_missing = updrs_clean["is_male"].isna().sum()
-n_total   = len(updrs_clean)
-print(f"is_male distribution: {updrs_clean['is_male'].value_counts(dropna=False).to_dict()}")
-print(f"is_male missing: {n_missing}/{n_total} ({100*n_missing/n_total:.1f}%)")
-if n_missing / n_total > 0.5:
-    print("WARNING: >50% of is_male values are NaN — sex feature will have low impact!")
+updrs_clean["is_male"] = updrs_clean["SEX"].map({1: 1, 2: 0})
 
 moca_sub = moca[["PATNO", "EVENT_ID", "MCATOT"]].dropna(subset=["MCATOT"])
 updrs_clean = updrs_clean.merge(moca_sub, on=["PATNO", "EVENT_ID"], how="left")
@@ -133,9 +106,18 @@ print(f"Unique patients:   {updrs_clean['PATNO'].nunique():,}")
 def trajectory_features(prior_rows):
     """
     Summarise all prior visits into scalar trajectory features.
-
     Deduplicates by visit_year first (averages scores within the same
     visit year) so linregress never receives identical x values.
+
+    v2 additions:
+      - traj_ema_score       : exponentially weighted mean (alpha=0.5)
+      - traj_weighted_slope  : slope with recency-weighted regression
+      - traj_quad_coef       : quadratic fit 2nd-order coefficient
+      - traj_score_velocity  : (last - first) / time_span
+      - traj_recent_rate     : rate of change over last two visits
+      - traj_visits_per_year : visit density
+      - traj_score_range     : max - min
+      - traj_recent_vs_slope : recent_rate / (overall slope + 1e-6)
     """
     deduped = (prior_rows
                .groupby("visit_year", as_index=False)["NP3TOT"]
@@ -146,6 +128,10 @@ def trajectory_features(prior_rows):
     times  = deduped["visit_year"].values.astype(float)
     n      = len(scores)
 
+    time_span   = float(times[-1] - times[0])
+    times_vary  = time_span > 0
+
+    # ---- base features (same as v1) ----
     feats = {
         "traj_n_visits":    float(n),
         "traj_first_score": float(scores[0]),
@@ -154,13 +140,12 @@ def trajectory_features(prior_rows):
         "traj_std_score":   float(np.std(scores)) if n > 1 else 0.0,
         "traj_min_score":   float(np.min(scores)),
         "traj_max_score":   float(np.max(scores)),
-        "traj_time_span":   float(times[-1] - times[0]),
+        "traj_time_span":   time_span,
         "traj_last_time":   float(times[-1]),
         "traj_last_delta":  float(scores[-1] - scores[-2]) if n >= 2 else 0.0,
         "traj_last_dt":     float(times[-1]  - times[-2])  if n >= 2 else 0.0,
     }
 
-    times_vary = float(np.ptp(times)) > 0
     if n >= 2 and times_vary:
         slope, intercept, r, _, _ = linregress(times, scores)
         feats["traj_slope"]     = float(slope)
@@ -185,12 +170,68 @@ def trajectory_features(prior_rows):
     else:
         feats["traj_accel"] = 0.0
 
+    # ---- v2: new features ----
+
+    # Exponential moving average (alpha=0.5 → heavier weight on recent visits)
+    alpha = 0.5
+    ema = scores[0]
+    for s in scores[1:]:
+        ema = alpha * s + (1 - alpha) * ema
+    feats["traj_ema_score"] = float(ema)
+
+    # Recency-weighted slope: weight each obs by its position (1..n)
+    if n >= 2 and times_vary:
+        weights = np.arange(1, n + 1, dtype=float)
+        w_mean_t = np.average(times,  weights=weights)
+        w_mean_s = np.average(scores, weights=weights)
+        cov = np.sum(weights * (times - w_mean_t) * (scores - w_mean_s))
+        var = np.sum(weights * (times - w_mean_t) ** 2)
+        feats["traj_weighted_slope"] = float(cov / var) if var > 0 else 0.0
+    else:
+        feats["traj_weighted_slope"] = 0.0
+
+    # Quadratic fit 2nd-order coefficient (captures curvature/acceleration)
+    if n >= 3 and times_vary:
+        coeffs = np.polyfit(times, scores, 2)
+        feats["traj_quad_coef"] = float(coeffs[0])
+    else:
+        feats["traj_quad_coef"] = 0.0
+
+    # Score velocity = net change / total time
+    feats["traj_score_velocity"] = (
+        float((scores[-1] - scores[0]) / time_span) if times_vary else 0.0
+    )
+
+    # Recent rate of change (last two deduplicated visits)
+    if n >= 2:
+        last_dt = times[-1] - times[-2]
+        feats["traj_recent_rate"] = (
+            float((scores[-1] - scores[-2]) / last_dt) if last_dt > 0 else 0.0
+        )
+    else:
+        feats["traj_recent_rate"] = 0.0
+
+    # Visit density
+    feats["traj_visits_per_year"] = (
+        float(n / time_span) if times_vary else float(n)
+    )
+
+    # Score range
+    feats["traj_score_range"] = float(np.max(scores) - np.min(scores))
+
+    # Recent rate vs overall slope ratio — captures whether patient is
+    # accelerating or decelerating relative to their historical trend
+    overall_slope = feats["traj_slope"]
+    recent_rate   = feats["traj_recent_rate"]
+    feats["traj_recent_vs_slope"] = float(
+        recent_rate / (abs(overall_slope) + 1e-6)
+    )
+
     return feats
 
 
 # ============================================================
 # BUILD LONGITUDINAL DATASET
-# Each sample = (all visits 0..k) -> predict visit k+1
 # ============================================================
 
 print("\nBuilding longitudinal prediction pairs...")
@@ -242,18 +283,48 @@ print(f"Prediction pairs:  {len(pairs_df):,}")
 print(f"Patients in pairs: {pairs_df['PATNO'].nunique():,}")
 
 # ============================================================
+# DERIVED INTERACTION FEATURES (added after building pairs_df)
+# ============================================================
+
+# Projected score: linear extrapolation using slope × dt
+# This is the "trend-following baseline" the model can refine
+pairs_df["projected_score"] = (
+    pairs_df["traj_last_score"] + pairs_df["traj_slope"] * pairs_df["dt_to_target"]
+)
+
+# EMA-based projection
+pairs_df["projected_ema"] = (
+    pairs_df["traj_ema_score"] + pairs_df["traj_weighted_slope"] * pairs_df["dt_to_target"]
+)
+
+# Deviation of last score from linear trend at last timepoint
+pairs_df["last_score_resid"] = (
+    pairs_df["traj_last_score"]
+    - (pairs_df["traj_intercept"] + pairs_df["traj_slope"] * pairs_df["traj_last_time"])
+)
+
+# ============================================================
 # FEATURE COLUMNS
 # ============================================================
 
 FEATURE_COLS = [
+    # trajectory — v1
     "traj_n_visits", "traj_first_score", "traj_last_score",
     "traj_mean_score", "traj_std_score", "traj_min_score", "traj_max_score",
     "traj_time_span", "traj_last_time", "traj_last_delta", "traj_last_dt",
     "traj_slope", "traj_intercept", "traj_r2", "traj_accel",
+    # trajectory — v2 new
+    "traj_ema_score", "traj_weighted_slope", "traj_quad_coef",
+    "traj_score_velocity", "traj_recent_rate", "traj_visits_per_year",
+    "traj_score_range", "traj_recent_vs_slope",
+    # clinical
     "age_at_last", "is_male", "moca_last", "hoehn_yahr_last",
     "putamen_sbr_last", "caudate_sbr_last",
     "is_on_med_last", "pdmedyn_last", "pdstate_enc_last",
+    # prediction horizon
     "dt_to_target",
+    # derived interactions
+    "projected_score", "projected_ema", "last_score_resid",
 ]
 
 X      = pairs_df[FEATURE_COLS].copy()
@@ -265,7 +336,7 @@ print(f"\nFinal dataset: {X.shape[0]:,} rows x {X.shape[1]} features")
 print("\nFeature completeness:")
 for col in FEATURE_COLS:
     pct = 100 * X[col].notna().mean()
-    print(f"  {col:25s}: {pct:6.1f}%")
+    print(f"  {col:28s}: {pct:6.1f}%")
 
 # ============================================================
 # TEMPORAL TRAIN / TEST SPLIT (80/20 by patient median year)
@@ -292,7 +363,7 @@ print(f"Train rows: {len(X_train):,} | patients: {len(train_patients):,}")
 print(f"Test rows:  {len(X_test):,}  | patients: {len(test_patients):,}")
 
 # ============================================================
-# BASELINE: predict last observed score
+# BASELINE: predict last observed score  (UNCHANGED from v1)
 # ============================================================
 
 print("\nBaseline: predict last observed score (no change)")
@@ -307,25 +378,28 @@ print(f"  RMSE: {bl_rmse:.2f}")
 print(f"  R2:   {bl_r2:.3f}")
 
 # ============================================================
-# XGBOOST MODEL
+# XGBOOST MODEL  (v2 — tuned hyperparameters)
 # ============================================================
 
-print("\nTraining XGBoost (longitudinal)...")
+print("\nTraining XGBoost (longitudinal v2)...")
 
 xgb_pipeline = Pipeline([
-    ("imputer", SimpleImputer(strategy="median")),
+    # KNNImputer (k=5) better preserves local structure than median
+    ("imputer", KNNImputer(n_neighbors=5)),
     ("model",   XGBRegressor(
-        objective        = "reg:squarederror",
-        n_estimators     = 600,
-        max_depth        = 4,
-        learning_rate    = 0.025,
-        subsample        = 0.8,
-        colsample_bytree = 0.75,
-        min_child_weight = 5,
-        reg_alpha        = 0.2,
-        reg_lambda       = 1.5,
-        random_state     = RANDOM_SEED,
-        n_jobs           = -1,
+        objective         = "reg:squarederror",
+        n_estimators      = 800,        # more trees (was 600)
+        max_depth         = 4,          # unchanged
+        learning_rate     = 0.02,       # slightly lower (was 0.025)
+        subsample         = 0.85,       # slightly higher (was 0.80)
+        colsample_bytree  = 0.80,       # slightly higher (was 0.75)
+        colsample_bylevel = 0.80,       # NEW: column subsampling per level
+        min_child_weight  = 4,          # slightly lower (was 5)
+        reg_alpha         = 0.3,        # slightly more L1 (was 0.2)
+        reg_lambda        = 1.2,        # slightly less L2 (was 1.5)
+        gamma             = 0.05,       # NEW: min gain to split — reduces over-splitting
+        random_state      = RANDOM_SEED,
+        n_jobs            = -1,
     ))
 ])
 
@@ -336,7 +410,7 @@ mae  = mean_absolute_error(y_test, preds)
 rmse = np.sqrt(mean_squared_error(y_test, preds))
 r2   = r2_score(y_test, preds)
 
-print("\nXGBoost (longitudinal) results:")
+print("\nXGBoost (longitudinal v2) results:")
 print(f"  MAE:         {mae:.2f}  (baseline: {bl_mae:.2f})")
 print(f"  RMSE:        {rmse:.2f}  (baseline: {bl_rmse:.2f})")
 print(f"  R2:          {r2:.3f}  (baseline: {bl_r2:.3f})")
@@ -364,7 +438,6 @@ importance_df.to_csv(
     os.path.join(OUTPUT_DIR, "xgb_long_feature_importance.csv"), index=False
 )
 
-# helper: avoid plt.close clobbering figure state
 def save(fname):
     path = os.path.join(OUTPUT_DIR, fname)
     plt.savefig(path, dpi=180, bbox_inches="tight")
@@ -382,28 +455,28 @@ lims = [min(float(y_test.min()), float(preds.min())) - 1,
 ax.plot(lims, lims, "r--", linewidth=1.5, label="Perfect prediction")
 ax.set_xlabel("Actual UPDRS-III (next visit)", fontsize=12)
 ax.set_ylabel("Predicted UPDRS-III", fontsize=12)
-ax.set_title(f"XGBoost Longitudinal: Predicted vs Actual\n"
+ax.set_title(f"XGBoost Longitudinal v2: Predicted vs Actual\n"
              f"MAE={mae:.2f}  RMSE={rmse:.2f}  R2={r2:.3f}", fontsize=12)
 ax.legend()
 ax.grid(True, alpha=0.3)
 plt.tight_layout()
-save("xgb_long_predicted_vs_actual.png")
+save("BETRAMAExgb_long_predicted_vs_actual.png")
 
 # ============================================================
 # PLOT 2: Feature Importance
 # ============================================================
 
-fig, ax = plt.subplots(figsize=(10, 8))
+fig, ax = plt.subplots(figsize=(10, 10))
 bars = ax.barh(np.array(FEATURE_COLS)[sorted_idx],
                importances[sorted_idx], color="steelblue", edgecolor="white")
 for bar, val in zip(bars, importances[sorted_idx]):
     ax.text(val + 0.001, bar.get_y() + bar.get_height() / 2,
-            f"{val:.3f}", va="center", fontsize=8)
+            f"{val:.3f}", va="center", fontsize=7)
 ax.set_xlabel("Feature importance (gain)", fontsize=12)
-ax.set_title("XGBoost Longitudinal — Feature Importance", fontsize=13)
+ax.set_title("XGBoost Longitudinal v2 — Feature Importance", fontsize=13)
 ax.grid(True, alpha=0.3, axis="x")
 plt.tight_layout()
-save("xgb_long_feature_importance.png")
+save("BETRAMAExgb_long_feature_importance.png")
 
 # ============================================================
 # PLOT 3: Residual histogram
@@ -416,11 +489,11 @@ ax.axvline(pairs_test["residual"].mean(), linestyle="--", color="orange",
            linewidth=1.5, label=f"Mean = {pairs_test['residual'].mean():.2f}")
 ax.set_xlabel("Residual (Predicted - Actual)", fontsize=12)
 ax.set_ylabel("Count", fontsize=12)
-ax.set_title("Residual Distribution — XGBoost Longitudinal", fontsize=13)
+ax.set_title("Residual Distribution — XGBoost Longitudinal v2", fontsize=13)
 ax.legend()
 ax.grid(True, alpha=0.3)
 plt.tight_layout()
-save("xgb_long_residuals.png")
+save("BETRAMAExgb_long_residuals.png")
 
 # ============================================================
 # PLOT 4: Absolute error histogram + cumulative CDF
@@ -462,7 +535,7 @@ axes[1].grid(True, alpha=0.3)
 
 plt.suptitle(f"Error Analysis — MAE={mae:.2f}, RMSE={rmse:.2f}", fontsize=13)
 plt.tight_layout()
-save("xgb_long_error_analysis.png")
+save("BETRAMAExgb_long_error_analysis.png")
 
 # ============================================================
 # PLOT 5: Model vs Baseline bar chart
@@ -476,7 +549,7 @@ fig, axes = plt.subplots(1, 3, figsize=(13, 5))
 colors = ["#4878cf", "#e87c2b"]
 for idx, (metric, bv, xv) in enumerate(zip(metrics, base_vals, xgb_vals)):
     vals   = [bv, xv]
-    labels = ["Baseline\n(no change)", "XGBoost\nLong."]
+    labels = ["Baseline\n(no change)", "XGBoost\nLong. v2"]
     bars   = axes[idx].bar(labels, vals, color=colors, width=0.5, edgecolor="white")
     for bar, v in zip(bars, vals):
         axes[idx].text(bar.get_x() + bar.get_width() / 2,
@@ -490,12 +563,12 @@ for idx, (metric, bv, xv) in enumerate(zip(metrics, base_vals, xgb_vals)):
     else:
         axes[idx].set_ylim(0, max(vals) * 1.3)
 
-fig.suptitle("XGBoost Longitudinal vs Baseline Performance", fontsize=14)
+fig.suptitle("XGBoost Longitudinal v2 vs Baseline Performance", fontsize=14)
 plt.tight_layout()
-save("xgb_long_model_vs_baseline.png")
+save("BETRAMAExgb_long_model_vs_baseline.png")
 
 # ============================================================
-# PLOT 6: Score distributions (actual vs predicted) + scatter by horizon
+# PLOT 6: Score distributions + scatter by horizon
 # ============================================================
 
 fig, axes = plt.subplots(1, 2, figsize=(13, 5))
@@ -528,7 +601,7 @@ axes[1].grid(True, alpha=0.3)
 
 plt.suptitle("Score Distribution & Prediction Quality", fontsize=13)
 plt.tight_layout()
-save("xgb_long_score_distributions.png")
+save("BETRAMAExgb_long_score_distributions.png")
 
 # ============================================================
 # PLOT 7: Five example patients
@@ -591,80 +664,7 @@ fig.suptitle(
     fontsize=13
 )
 plt.tight_layout(rect=[0, 0, 1, 0.96])
-save("xgb_long_five_patients.png")
-
-
-# ============================================================
-# PLOT 9: Average trajectory — all test patients
-# ============================================================
-
-# Group by visit year: mean actual and mean predicted across all test patients
-avg = (pairs_test.groupby("target_visit_yr")
-                 .agg(
-                     mean_actual    = ("actual",    "mean"),
-                     mean_predicted = ("predicted", "mean"),
-                     n              = ("actual",    "count"),
-                 )
-                 .reset_index()
-                 .sort_values("target_visit_yr"))
-
-# Anchor point: average last-known score at the earliest prediction point
-anchor_year  = float(pairs_test["traj_last_time"].loc[
-    pairs_test["target_visit_yr"] == avg["target_visit_yr"].iloc[0]
-].mean())
-anchor_score = float(pairs_test["traj_last_score"].loc[
-    pairs_test["target_visit_yr"] == avg["target_visit_yr"].iloc[0]
-].mean())
-
-years      = avg["target_visit_yr"].values
-act_mean   = avg["mean_actual"].values
-pred_mean  = avg["mean_predicted"].values
-n_pts      = avg["n"].values
-
-fig, ax = plt.subplots(figsize=(11, 6))
-
-# Mean lines only (no std shading)
-ax.plot(years, act_mean,  marker="o", linewidth=2.5, markersize=7,
-        color="steelblue", label="Measured (mean)")
-ax.plot(years, pred_mean, marker="s", linewidth=2.5, markersize=7,
-        linestyle="--", color="coral", label="Predicted (mean)")
-
-# Dotted bridge from anchor to first prediction
-ax.plot([anchor_year, years[0]], [anchor_score, pred_mean[0]],
-        ":", color="coral", linewidth=1.5, alpha=0.6)
-ax.plot([anchor_year, years[0]], [anchor_score, act_mean[0]],
-        ":", color="steelblue", linewidth=1.5, alpha=0.6)
-
-# Anchor dot
-ax.scatter([anchor_year], [anchor_score], color="gray", zorder=5, s=60,
-           label=f"Avg last known score ({anchor_score:.1f})")
-
-# Annotate mean values and n at each visit year
-for yr, am, pm, n in zip(years, act_mean, pred_mean, n_pts):
-    ax.annotate(f"{am:.1f}", (yr, am),
-                textcoords="offset points", xytext=(0, 10),
-                ha="center", fontsize=8, color="steelblue")
-    ax.annotate(f"{pm:.1f}(n={int(n)})", (yr, pm),
-                textcoords="offset points", xytext=(0, -22),
-                ha="center", fontsize=8, color="coral")
-
-# Overall MAE annotation
-overall_mae = float(pairs_test["abs_error"].mean())
-ax.text(0.02, 0.97, f"Overall MAE = {overall_mae:.2f}",
-        transform=ax.transAxes, fontsize=10, va="top",
-        bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.8))
-
-ax.set_xlabel("Visit year", fontsize=12)
-ax.set_ylabel("UPDRS-III Score (higher = worse)", fontsize=12)
-ax.set_title(
-    "Average UPDRS-III Trajectory — All Test Patients"
-    "Measured vs Predicted (mean ± 1 std dev, next-visit prediction)",
-    fontsize=13
-)
-ax.legend(fontsize=10)
-ax.grid(True, alpha=0.3)
-plt.tight_layout()
-save("xgb_long_average_trajectory.png")
+save("BETRAMAExgb_long_five_patients.png")
 
 # ============================================================
 # PLOT 8: Error by prediction horizon
@@ -702,7 +702,7 @@ ax.set_title("Prediction Error by Forecast Horizon", fontsize=13)
 ax.legend()
 ax.grid(True, alpha=0.3, axis="y")
 plt.tight_layout()
-save("xgb_long_error_by_horizon.png")
+save("BETRAMAExgb_long_error_by_horizon.png")
 
 # ============================================================
 # SUMMARY
@@ -711,11 +711,11 @@ save("xgb_long_error_by_horizon.png")
 print("\n" + "=" * 72)
 print("FINAL SUMMARY")
 print("=" * 72)
-print(f"{'Metric':<10} {'Baseline':>12} {'XGBoost Long.':>15} {'Improvement':>14}")
-print("-" * 55)
-print(f"{'MAE':<10} {bl_mae:>12.2f} {mae:>15.2f}  {100*(bl_mae-mae)/bl_mae:>12.1f}%")
-print(f"{'RMSE':<10} {bl_rmse:>12.2f} {rmse:>15.2f}  {100*(bl_rmse-rmse)/bl_rmse:>12.1f}%")
-print(f"{'R2':<10} {bl_r2:>12.3f} {r2:>15.3f}")
+print(f"{'Metric':<10} {'Baseline':>12} {'XGBoost Long. v2':>18} {'Improvement':>14}")
+print("-" * 58)
+print(f"{'MAE':<10} {bl_mae:>12.2f} {mae:>18.2f}  {100*(bl_mae-mae)/bl_mae:>12.1f}%")
+print(f"{'RMSE':<10} {bl_rmse:>12.2f} {rmse:>18.2f}  {100*(bl_rmse-rmse)/bl_rmse:>12.1f}%")
+print(f"{'R2':<10} {bl_r2:>12.3f} {r2:>18.3f}")
 print(f"\n% predictions within  5 pts: {pct_within_5:.1f}%")
 print(f"% predictions within 10 pts: {pct_within_10:.1f}%")
 print("\nTop 10 features by importance:")
