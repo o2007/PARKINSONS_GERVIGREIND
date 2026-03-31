@@ -735,71 +735,87 @@ save("xgb_long_five_patients.png")
 
 # ============================================================
 # PLOT 9: Average trajectory — all test patients
+# x-axis = years since each patient's first prediction point
+# one row per patient per relative year
 # ============================================================
 
-# Group by visit year: mean actual and mean predicted across all test patients
-avg = (pairs_test.groupby("target_visit_yr")
-                 .agg(
-                     mean_actual    = ("actual",    "mean"),
-                     mean_predicted = ("predicted", "mean"),
-                     n              = ("actual",    "count"),
-                 )
-                 .reset_index()
-                 .sort_values("target_visit_yr"))
+pairs_test_plot = pairs_test.copy()
 
-# Anchor point: average last-known score at the earliest prediction point
-anchor_year  = float(pairs_test["traj_last_time"].loc[
-    pairs_test["target_visit_yr"] == avg["target_visit_yr"].iloc[0]
-].mean())
-anchor_score = float(pairs_test["traj_last_score"].loc[
-    pairs_test["target_visit_yr"] == avg["target_visit_yr"].iloc[0]
-].mean())
+# Relative time: first target visit for each patient becomes year 0
+pairs_test_plot["relative_year"] = (
+    pairs_test_plot["target_visit_yr"]
+    - pairs_test_plot.groupby("PATNO")["target_visit_yr"].transform("min")
+)
 
-years      = avg["target_visit_yr"].values
-act_mean   = avg["mean_actual"].values
-pred_mean  = avg["mean_predicted"].values
-n_pts      = avg["n"].values
+# Keep only one row per patient per relative year
+pairs_test_plot_unique = (
+    pairs_test_plot
+    .sort_values(["PATNO", "target_visit_yr"])
+    .groupby(["PATNO", "relative_year"], as_index=False)
+    .first()
+)
+
+# Average measured and predicted score by relative year
+avg = (pairs_test_plot_unique.groupby("relative_year")
+                           .agg(
+                               mean_actual    = ("actual", "mean"),
+                               mean_predicted = ("predicted", "mean"),
+                               n              = ("PATNO", "nunique"),
+                           )
+                           .reset_index()
+                           .sort_values("relative_year"))
+
+# Anchor point: average last-known score at the first prediction point
+first_mask = pairs_test_plot_unique["relative_year"] == avg["relative_year"].iloc[0]
+anchor_year  = 0.0
+anchor_score = float(pairs_test_plot_unique.loc[first_mask, "traj_last_score"].mean())
+
+years     = avg["relative_year"].values
+act_mean  = avg["mean_actual"].values
+pred_mean = avg["mean_predicted"].values
+n_pts     = avg["n"].values
 
 fig, ax = plt.subplots(figsize=(11, 6))
 
-# Mean lines only (no std shading)
-ax.plot(years, act_mean,  marker="o", linewidth=2.5, markersize=7,
+# Mean lines
+ax.plot(years, act_mean, marker="o", linewidth=2.5, markersize=7,
         color="steelblue", label="Mælt meðalgildi")
 ax.plot(years, pred_mean, marker="s", linewidth=2.5, markersize=7,
         linestyle="--", color="coral", label="Spáð meðalgildi")
 
-# Dotted bridge from anchor to first prediction
+# Dotted bridge from anchor to first prediction point
 ax.plot([anchor_year, years[0]], [anchor_score, pred_mean[0]],
         ":", color="coral", linewidth=1.5, alpha=0.6)
 ax.plot([anchor_year, years[0]], [anchor_score, act_mean[0]],
         ":", color="steelblue", linewidth=1.5, alpha=0.6)
 
 # Anchor dot
-ax.scatter([anchor_year], [anchor_score], color="gray", zorder=5, s=60,
-           label=f"Meðaltal fyrsta þekkts gildis ({anchor_score:.1f})")
+#ax.scatter([anchor_year], [anchor_score], color="gray", zorder=5, s=60,
+           #label=f"Meðaltal fyrsta þekkts gildis ({anchor_score:.1f})")
 
-# Annotate mean values and n at each visit year
+# Annotate mean values and patient count
 for yr, am, pm, n in zip(years, act_mean, pred_mean, n_pts):
-    ax.annotate(f"{am:.1f}", (yr, am),
+    ax.annotate(f"{pm:.1f}", (yr, pm),
                 textcoords="offset points", xytext=(0, 10),
-                ha="center", fontsize=8, color="steelblue")
-    ax.annotate(f"{pm:.1f}\n(n={int(n)})", (yr, pm),
-                textcoords="offset points", xytext=(0, -22),
                 ha="center", fontsize=8, color="coral")
+    ax.annotate(f"{am:.1f}", (yr, am),
+                textcoords="offset points", xytext=(0, -22),
+                ha="center", fontsize=8, color="steelblue")
 
 # Overall MAE annotation
-overall_mae = float(pairs_test["abs_error"].mean())
+overall_mae = float(pairs_test_plot_unique["abs_error"].mean())
 ax.text(0.02, 0.97, f"Heildar MAE = {overall_mae:.2f}",
         transform=ax.transAxes, fontsize=10, va="top",
         bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.8))
 
-ax.set_xlabel("Ár heimsóknar", fontsize=12)
+ax.set_xlabel("Ár frá fyrstu spáheimsókn", fontsize=12)
 ax.set_ylabel("UPDRS-III skor (hærra = verra)", fontsize=12)
 ax.set_title(
     "Meðal UPDRS-III prófunarsjúklinga\n"
-    "Mælt vs spáð (meðalgildi, spá í næstu heimsókn)",
+    "Mælt vs spáð miðað við tíma frá fyrstu spáheimsókn",
     fontsize=13
 )
+
 ax.legend(fontsize=10)
 ax.grid(True, alpha=0.3)
 plt.tight_layout()
