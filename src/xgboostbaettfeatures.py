@@ -19,6 +19,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from scipy.stats import linregress
+from sklearn.base import clone
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
@@ -34,6 +35,7 @@ DATA_DIR         = "./data/PPMI_data"
 OUTPUT_DIR       = "./ppmi_outputs"
 RANDOM_SEED      = 42
 MIN_PRIOR_VISITS = 2   # need at least this many distinct prior visit years
+N_BOOTSTRAPS     = 20  # for bias-variance estimation on the fixed test set
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -477,11 +479,51 @@ mae  = mean_absolute_error(y_test, preds)
 rmse = np.sqrt(mean_squared_error(y_test, preds))
 r2   = r2_score(y_test, preds)
 
+# Bias-variance estimation:
+# fit the same pipeline on bootstrap resamples of the training patients and
+# measure variability of predictions on the fixed test set.
+print(f"Estimating bias-variance with {N_BOOTSTRAPS} bootstrap refits...")
+residuals = preds - y_test.values
+mse = float(np.mean(residuals ** 2))
+
+rng = np.random.default_rng(RANDOM_SEED)
+train_patient_ids = np.array(sorted(train_patients))
+train_groups = {
+    patno: grp.reset_index(drop=True)
+    for patno, grp in pairs_train.groupby("PATNO", sort=False)
+}
+bootstrap_preds = []
+
+for b in range(N_BOOTSTRAPS):
+    sampled_patients = rng.choice(train_patient_ids, size=len(train_patient_ids), replace=True)
+    boot_df = pd.concat([train_groups[patno] for patno in sampled_patients], ignore_index=True)
+
+    boot_model = clone(xgb_pipeline)
+    boot_model.set_params(model__random_state=RANDOM_SEED + b + 1)
+    boot_model.fit(boot_df[FEATURE_COLS], boot_df["target_updrs3"])
+    bootstrap_preds.append(boot_model.predict(X_test))
+
+bootstrap_preds = np.asarray(bootstrap_preds)
+mean_boot_pred = bootstrap_preds.mean(axis=0)
+pointwise_variance = bootstrap_preds.var(axis=0, ddof=1) if N_BOOTSTRAPS > 1 else np.zeros(len(X_test))
+signed_biases = mean_boot_pred - y_test.values
+
+bias = float(np.mean(signed_biases))
+bias_sq = float(np.mean(signed_biases ** 2))
+variance = float(np.mean(pointwise_variance))
+decomp_estimate = bias_sq + variance
+
 print("\nXGBoost (longitudinal) results:")
 print(f"  MAE:         {mae:.2f}  (baseline: {bl_mae:.2f})")
 print(f"  RMSE:        {rmse:.2f}  (baseline: {bl_rmse:.2f})")
 print(f"  R2:          {r2:.3f}  (baseline: {bl_r2:.3f})")
 print(f"  MAE improve: {100*(bl_mae - mae)/bl_mae:.1f}% over baseline")
+print(f"\nBias–Variance decomposition (on test set):")
+print(f"  Bias  (mean signed error):  {bias:+.3f}  (positive = overpredicts)")
+print(f"  Mean bias² across test set: {bias_sq:.3f}")
+print(f"  Mean model variance:        {variance:.3f}")
+print(f"  Bias² + Variance:           {decomp_estimate:.3f}")
+print(f"  Test MSE (single model):    {mse:.3f}")
 
 # ============================================================
 # STORE TEST RESULTS
@@ -675,7 +717,8 @@ save("xgb_long_score_distributions.png")
 # PLOT 7: Five example patients
 # ============================================================
 
-patient_counts = pairs_test.groupby("PATNO").size()
+pd_pairs_test = pairs_test[pairs_test["cohort"] == 1].copy()
+patient_counts = pd_pairs_test.groupby("PATNO").size()
 selected_pats  = (patient_counts[patient_counts >= 3]
                   .sort_values(ascending=False)
                   .index[:5]
@@ -688,7 +731,7 @@ axes = axes.flatten()
 
 for i, patno in enumerate(selected_pats):
     ax = axes[i]
-    pt = pairs_test[pairs_test["PATNO"] == patno].sort_values("target_visit_yr")
+    pt = pd_pairs_test[pd_pairs_test["PATNO"] == patno].sort_values("target_visit_yr")
 
     target_years     = pt["target_visit_yr"].values
     actual_future    = pt["actual"].values
@@ -765,8 +808,8 @@ fig, ax = plt.subplots(figsize=(11, 6))
 # Mean lines only (no std shading)
 ax.plot(years, act_mean,  marker="o", linewidth=2.5, markersize=7,
         color="steelblue", label="Mælt meðalgildi")
-ax.plot(years, pred_mean, marker="s", linewidth=2.5, markersize=7,
-        linestyle="--", color="coral", label="Spáð meðalgildi")
+# ax.plot(years, pred_mean, marker="s", linewidth=2.5, markersize=7,
+#        linestyle="--", color="coral", label="Spáð meðalgildi")
 
 # Dotted bridge from anchor to first prediction
 ax.plot([anchor_year, years[0]], [anchor_score, pred_mean[0]],
@@ -857,6 +900,12 @@ print(f"{'RMSE':<10} {bl_rmse:>12.2f} {rmse:>15.2f}  {100*(bl_rmse-rmse)/bl_rmse
 print(f"{'R2':<10} {bl_r2:>12.3f} {r2:>15.3f}")
 print(f"\n% predictions within  5 pts: {pct_within_5:.1f}%")
 print(f"% predictions within 10 pts: {pct_within_10:.1f}%")
+print(f"\nBias–Variance decomposition:")
+print(f"  Bias  (mean signed error):  {bias:+.3f}")
+print(f"  Mean bias² across test set: {bias_sq:.3f}")
+print(f"  Mean model variance:        {variance:.3f}")
+print(f"  Bias² + Variance:           {decomp_estimate:.3f}")
+print(f"  Test MSE (single model):    {mse:.3f}")
 print("\nTop 10 features by importance:")
 print(importance_df.head(10).to_string(index=False))
 print("\nAll outputs saved to:", OUTPUT_DIR)
