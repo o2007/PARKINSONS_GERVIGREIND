@@ -520,10 +520,10 @@ fig, ax = plt.subplots(figsize=(7, 6))
 ax.scatter(y_test, preds, alpha=0.35, s=18, color="steelblue")
 lims = [min(float(y_test.min()), float(preds.min())) - 1,
         max(float(y_test.max()), float(preds.max())) + 1]
-ax.plot(lims, lims, "r--", linewidth=1.5, label="Perfect prediction")
-ax.set_xlabel("Actual UPDRS-III (next visit)", fontsize=12)
-ax.set_ylabel("Predicted UPDRS-III", fontsize=12)
-ax.set_title(f"XGBoost Longitudinal: Predicted vs Actual\n"
+ax.plot(lims, lims, "r--", linewidth=1.5, label="Fullkomin spá")
+ax.set_xlabel("Raunverulegt UPDRS-III (næsta heimsókn)", fontsize=12)
+ax.set_ylabel("Spáð UPDRS-III", fontsize=12)
+ax.set_title(f"XGBoost: Spáð vs Raunverulegt\n"
              f"MAE={mae:.2f}  RMSE={rmse:.2f}  R2={r2:.3f}", fontsize=12)
 ax.legend()
 ax.grid(True, alpha=0.3)
@@ -540,8 +540,8 @@ bars = ax.barh(np.array(FEATURE_COLS)[sorted_idx],
 for bar, val in zip(bars, importances[sorted_idx]):
     ax.text(val + 0.001, bar.get_y() + bar.get_height() / 2,
             f"{val:.3f}", va="center", fontsize=8)
-ax.set_xlabel("Feature importance (gain)", fontsize=12)
-ax.set_title("XGBoost Longitudinal — Feature Importance", fontsize=13)
+ax.set_xlabel("Vægi einkenna (e.gain)", fontsize=12)
+ax.set_title("XGBoost: Vægi einkenna", fontsize=13)
 ax.grid(True, alpha=0.3, axis="x")
 plt.tight_layout()
 save("xgb_long_feature_importance.png")
@@ -574,13 +574,13 @@ pct_within_10 = 100 * float(np.mean(abs_errs <= 10))
 fig, axes = plt.subplots(1, 2, figsize=(13, 5))
 
 axes[0].hist(abs_errs, bins=45, edgecolor="white", color="steelblue")
-axes[0].axvline(5,  linestyle="--", color="orange", linewidth=1.5, label="5-pt threshold")
-axes[0].axvline(10, linestyle="--", color="red",    linewidth=1.5, label="10-pt threshold")
+axes[0].axvline(5,  linestyle="--", color="orange", linewidth=1.5, label="5-pt þröskuldur")
+axes[0].axvline(10, linestyle="--", color="red",    linewidth=1.5, label="10-pt þröskuldur")
 axes[0].axvline(float(np.median(abs_errs)), linestyle=":", color="green", linewidth=1.5,
-                label=f"Median = {float(np.median(abs_errs)):.1f}")
-axes[0].set_xlabel("Absolute error", fontsize=12)
-axes[0].set_ylabel("Count", fontsize=12)
-axes[0].set_title("Absolute Error Distribution", fontsize=13)
+                label=f"Miðgildi = {float(np.median(abs_errs)):.1f}")
+axes[0].set_xlabel("Töluleg skekkja (MAE) ", fontsize=12)
+axes[0].set_ylabel("Fjöldi", fontsize=12)
+axes[0].set_title("Heildar dreifing skekkju", fontsize=13)
 axes[0].legend()
 axes[0].grid(True, alpha=0.3)
 
@@ -589,19 +589,19 @@ cdf = np.arange(1, len(sorted_errs) + 1) / len(sorted_errs)
 axes[1].plot(sorted_errs, cdf * 100, color="steelblue", linewidth=2)
 axes[1].axvline(5,  linestyle="--", color="orange", linewidth=1.5, label="5 pts")
 axes[1].axvline(10, linestyle="--", color="red",    linewidth=1.5, label="10 pts")
-axes[1].annotate(f"{pct_within_5:.1f}% within 5 pts",
+axes[1].annotate(f"{pct_within_5:.1f}% innan 5 pts",
                  xy=(5, pct_within_5), xytext=(7, max(pct_within_5 - 10, 5)),
                  arrowprops=dict(arrowstyle="->"), fontsize=9)
-axes[1].annotate(f"{pct_within_10:.1f}% within 10 pts",
+axes[1].annotate(f"{pct_within_10:.1f}% innan 10 pts",
                  xy=(10, pct_within_10), xytext=(12, max(pct_within_10 - 10, 5)),
                  arrowprops=dict(arrowstyle="->"), fontsize=9)
-axes[1].set_xlabel("Absolute error threshold", fontsize=12)
-axes[1].set_ylabel("% of predictions", fontsize=12)
-axes[1].set_title("Cumulative Error Distribution", fontsize=13)
+axes[1].set_xlabel("Töluleg skekkja - þröskuldur", fontsize=12)
+axes[1].set_ylabel("% af spám", fontsize=12)
+axes[1].set_title("Uppsöfnuð dreifing skekkju", fontsize=13)
 axes[1].legend()
 axes[1].grid(True, alpha=0.3)
 
-plt.suptitle(f"Error Analysis — MAE={mae:.2f}, RMSE={rmse:.2f}", fontsize=13)
+plt.suptitle(f"Skekkja:  MAE={mae:.2f}, RMSE={rmse:.2f}", fontsize=13)
 plt.tight_layout()
 save("xgb_long_error_analysis.png")
 
@@ -617,7 +617,7 @@ fig, axes = plt.subplots(1, 3, figsize=(13, 5))
 colors = ["#4878cf", "#e87c2b"]
 for idx, (metric, bv, xv) in enumerate(zip(metrics, base_vals, xgb_vals)):
     vals   = [bv, xv]
-    labels = ["Baseline\n(no change)", "XGBoost\nLong."]
+    labels = ["Grunnlíkan", "XGBoost"]
     bars   = axes[idx].bar(labels, vals, color=colors, width=0.5, edgecolor="white")
     for bar, v in zip(bars, vals):
         axes[idx].text(bar.get_x() + bar.get_width() / 2,
@@ -631,7 +631,7 @@ for idx, (metric, bv, xv) in enumerate(zip(metrics, base_vals, xgb_vals)):
     else:
         axes[idx].set_ylim(0, max(vals) * 1.3)
 
-fig.suptitle("XGBoost Longitudinal vs Baseline Performance", fontsize=14)
+fig.suptitle("XGBoost vs Grunnlíkan", fontsize=14)
 plt.tight_layout()
 save("xgb_long_model_vs_baseline.png")
 
@@ -642,16 +642,16 @@ save("xgb_long_model_vs_baseline.png")
 fig, axes = plt.subplots(1, 2, figsize=(13, 5))
 
 axes[0].hist(y_test.values, bins=35, alpha=0.7, color="steelblue",
-             edgecolor="white", label="Actual")
+             edgecolor="white", label="Raunverulegt")
 axes[0].hist(preds, bins=35, alpha=0.7, color="coral",
-             edgecolor="white", label="Predicted")
+             edgecolor="white", label="Spáð")
 axes[0].axvline(float(y_test.mean()), color="steelblue", linestyle="--",
-                linewidth=1.5, label=f"Actual mean={float(y_test.mean()):.1f}")
+                linewidth=1.5, label=f"Raunverulegt meðalgildi={float(y_test.mean()):.1f}")
 axes[0].axvline(float(preds.mean()), color="coral", linestyle="--",
-                linewidth=1.5, label=f"Pred mean={float(preds.mean()):.1f}")
-axes[0].set_xlabel("UPDRS-III Score", fontsize=12)
-axes[0].set_ylabel("Count", fontsize=12)
-axes[0].set_title("Actual vs Predicted Score Distribution (test set)", fontsize=12)
+                linewidth=1.5, label=f"Spáð meðalgildi={float(preds.mean()):.1f}")
+axes[0].set_xlabel("UPDRS-III Hreyfiskor", fontsize=12)
+axes[0].set_ylabel("Fjöldi", fontsize=12)
+axes[0].set_title("Raunverulegt vs spáð - dreifing niðurstaða. (prófunar sett)", fontsize=12)
 axes[0].legend(fontsize=9)
 axes[0].grid(True, alpha=0.3)
 
@@ -702,9 +702,9 @@ for i, patno in enumerate(selected_pats):
     all_s = np.concatenate([[first_score], actual_future])
 
     ax.plot(all_t, all_s, marker="o", linewidth=2.5,
-            color="steelblue", label="Measured", zorder=3)
+            color="steelblue", label="Mælt", zorder=3)
     ax.plot(target_years, predicted_future, marker="s", linestyle="--",
-            linewidth=2, color="coral", label="Predicted", zorder=3)
+            linewidth=2, color="coral", label="Spáð", zorder=3)
     ax.plot([first_time, target_years[0]], [first_score, predicted_future[0]],
             ":", color="coral", linewidth=1.5, alpha=0.6)
 
@@ -717,8 +717,8 @@ for i, patno in enumerate(selected_pats):
                     textcoords="offset points", xytext=(0, -14),
                     ha="center", fontsize=8, color="coral")
 
-    ax.set_title(f"Patient {patno}  |  MAE = {mae_pt:.2f}", fontsize=11)
-    ax.set_xlabel("Visit year", fontsize=10)
+    ax.set_title(f"Sjúklingur {patno}  |  MAE = {mae_pt:.2f}", fontsize=11)
+    ax.set_xlabel("Ár heimsóknar", fontsize=10)
     ax.set_ylabel("UPDRS-III", fontsize=10)
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
@@ -727,9 +727,7 @@ for j in range(len(selected_pats), len(axes)):
     fig.delaxes(axes[j])
 
 fig.suptitle(
-    "Five Example Patients — Measured vs Predicted Future UPDRS-III\n"
-    "(Model uses ALL prior visits to predict next visit)",
-    fontsize=13
+    "Prófun á fimm sjúklingum - Mælt vs sáð framtíðar UPDRS-III\n", fontsize=13
 )
 plt.tight_layout(rect=[0, 0, 1, 0.96])
 save("xgb_long_five_patients.png")
@@ -766,9 +764,9 @@ fig, ax = plt.subplots(figsize=(11, 6))
 
 # Mean lines only (no std shading)
 ax.plot(years, act_mean,  marker="o", linewidth=2.5, markersize=7,
-        color="steelblue", label="Measured (mean)")
+        color="steelblue", label="Mælt meðalgildi")
 ax.plot(years, pred_mean, marker="s", linewidth=2.5, markersize=7,
-        linestyle="--", color="coral", label="Predicted (mean)")
+        linestyle="--", color="coral", label="Spáð meðalgildi")
 
 # Dotted bridge from anchor to first prediction
 ax.plot([anchor_year, years[0]], [anchor_score, pred_mean[0]],
@@ -778,7 +776,7 @@ ax.plot([anchor_year, years[0]], [anchor_score, act_mean[0]],
 
 # Anchor dot
 ax.scatter([anchor_year], [anchor_score], color="gray", zorder=5, s=60,
-           label=f"Avg last known score ({anchor_score:.1f})")
+           label=f"Meðaltal fyrsta þekkts gildis ({anchor_score:.1f})")
 
 # Annotate mean values and n at each visit year
 for yr, am, pm, n in zip(years, act_mean, pred_mean, n_pts):
@@ -791,15 +789,15 @@ for yr, am, pm, n in zip(years, act_mean, pred_mean, n_pts):
 
 # Overall MAE annotation
 overall_mae = float(pairs_test["abs_error"].mean())
-ax.text(0.02, 0.97, f"Overall MAE = {overall_mae:.2f}",
+ax.text(0.02, 0.97, f"Heildar MAE = {overall_mae:.2f}",
         transform=ax.transAxes, fontsize=10, va="top",
         bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.8))
 
-ax.set_xlabel("Visit year", fontsize=12)
-ax.set_ylabel("UPDRS-III Score (higher = worse)", fontsize=12)
+ax.set_xlabel("Ár heimsóknar", fontsize=12)
+ax.set_ylabel("UPDRS-III skor (hærra = verra)", fontsize=12)
 ax.set_title(
-    "Average UPDRS-III Trajectory — All Test Patients\n"
-    "Measured vs Predicted (mean, next-visit prediction)",
+    "Meðal UPDRS-III prófunarsjúklinga\n"
+    "Mælt vs spáð (meðalgildi, spá í næstu heimsókn)",
     fontsize=13
 )
 ax.legend(fontsize=10)
