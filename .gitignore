@@ -1,5 +1,8 @@
 venv/
 data/
-data/
 ppmi_outputs/
 .DS_Store
+__pycache__/
+*.pyc
+*.pyo
+notebooks/*.ipynb
